@@ -1,0 +1,12 @@
+{
+  "name": "P2P-Messenger-2",
+  "description": "Serverless peer-to-peer decentralized messenger with original quality media transfer, WebRTC audio/video calls, and flexible storage controls.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
