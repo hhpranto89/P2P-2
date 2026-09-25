@@ -42,6 +42,7 @@ export default function ChatScreen({
   remotePeerId,
   contactName,
   connectionState,
+  presenceMap = {},
   onBack,
   onStartCall,
   onOpenSettings,
@@ -64,6 +65,10 @@ export default function ChatScreen({
   const recordTimerRef = useRef(null);
 
   const incomingFilesRef = useRef(new Map());
+
+  // Determine current presence from presenceMap or local state
+  const remoteKey = remotePeerId?.toLowerCase();
+  const currentPresence = presenceMap[remoteKey] || peerPresence;
 
   // Load chat history when switching peers
   useEffect(() => {
@@ -88,7 +93,7 @@ export default function ChatScreen({
       const outbox = contactService.getOutbox(myPeerId, remotePeerId);
       if (outbox.length > 0) {
         outbox.forEach((pendingMsg) => {
-          const { sent } = p2p.sendChatMessage(pendingMsg.text, pendingMsg.id);
+          const { sent } = p2p.sendChatMessage(pendingMsg.text, remotePeerId, pendingMsg.id);
           if (sent) {
             contactService.removeFromOutbox(myPeerId, remotePeerId, pendingMsg.id);
             contactService.updateMessageStatus(myPeerId, remotePeerId, pendingMsg.id, 'sent');
@@ -105,50 +110,38 @@ export default function ChatScreen({
     flushOutbox();
   }, [flushOutbox]);
 
-  // Wire up P2P Network Data Channel events
+  // Wire up P2P Network Data Channel events with proper unsubscription
   useEffect(() => {
     if (!p2p) return;
 
     // Track active peer presence
-    p2p.on('onPresenceChange', ({ peerId, status }) => {
+    const unsubPresence = p2p.on('onPresenceChange', ({ peerId, status }) => {
       if (peerId?.toLowerCase() === remotePeerId?.toLowerCase()) {
         setPeerPresence(status);
       }
     });
 
-    // Delivery confirmation acknowledgment
-    p2p.on('onMessageAck', ({ messageId }) => {
-      if (myPeerId && remotePeerId) {
-        contactService.updateMessageStatus(myPeerId, remotePeerId, messageId, 'delivered');
+    // Delivery confirmation acknowledgment (✓✓ delivered)
+    const unsubAck = p2p.on('onMessageAck', ({ messageId, peerId }) => {
+      if (!peerId || peerId?.toLowerCase() === remotePeerId?.toLowerCase()) {
         setMessages((prev) =>
           prev.map((m) => (m.id === messageId ? { ...m, status: 'delivered' } : m))
         );
       }
     });
 
-    // Incoming text/control messages
-    p2p.on('onMessage', (msg) => {
-      if (msg.type === 'chat') {
-        const newMsg = {
-          id: msg.id || `msg_${Date.now()}`,
-          text: msg.text,
-          sender: msg.sender || remotePeerId,
-          timestamp: msg.timestamp || Date.now(),
-          isSelf: false,
-        };
-
-        setMessages((prev) => [...prev, newMsg]);
-        audioRinger.playMessageBeep();
-
-        if (myPeerId && remotePeerId) {
-          contactService.saveChatMessage(myPeerId, remotePeerId, newMsg);
-          contactService.updateLastMessage(myPeerId, remotePeerId, msg.text, newMsg.timestamp);
-        }
+    // Incoming text/control messages for this chat
+    const unsubMsg = p2p.on('onMessage', (msg) => {
+      if (msg.type === 'chat' && msg.sender?.toLowerCase() === remotePeerId?.toLowerCase()) {
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
       }
     });
 
     // Incoming file metadata header
-    p2p.on('onFileMeta', (meta) => {
+    const unsubMeta = p2p.on('onFileMeta', (meta) => {
       const { fileId, name, size, mimeType, totalChunks, thumbnail } = meta;
       incomingFilesRef.current.set(fileId, {
         meta,
@@ -167,7 +160,7 @@ export default function ChatScreen({
     });
 
     // Incoming file chunk
-    p2p.on('onFileChunk', (chunkData) => {
+    const unsubChunk = p2p.on('onFileChunk', (chunkData) => {
       const { fileId, index, chunk } = chunkData;
       const fileEntry = incomingFilesRef.current.get(fileId);
       if (!fileEntry) return;
@@ -228,7 +221,13 @@ export default function ChatScreen({
       }
     });
 
-    return () => {};
+    return () => {
+      unsubPresence();
+      unsubAck();
+      unsubMsg();
+      unsubMeta();
+      unsubChunk();
+    };
   }, [p2p, remotePeerId, myPeerId]);
 
   const base64ToArrayBuffer = (base64) => {
@@ -258,15 +257,15 @@ export default function ChatScreen({
 
     const text = inputMessage.trim();
     const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    const isOnline = connectionState === 'connected';
 
+    // Optimistically add message to local UI state
     const sentMsg = {
       id: msgId,
       text,
       sender: myPeerId,
       timestamp: Date.now(),
       isSelf: true,
-      status: isOnline ? 'sent' : 'pending', // 'pending' 🕒 if offline, 'sent' ✓ if online
+      status: 'pending', // default pending until sent confirmation
     };
 
     setMessages((prev) => [...prev, sentMsg]);
@@ -276,11 +275,13 @@ export default function ChatScreen({
       contactService.saveChatMessage(myPeerId, remotePeerId, sentMsg);
       contactService.updateLastMessage(myPeerId, remotePeerId, sentMsg.text, sentMsg.timestamp);
 
-      if (isOnline) {
-        p2p.sendChatMessage(text, msgId);
-      } else {
-        // Option 1: Queue in sender's local outbox
-        contactService.saveToOutbox(myPeerId, remotePeerId, sentMsg);
+      // Attempt immediate P2P send
+      const { sent } = p2p.sendChatMessage(text, remotePeerId, msgId);
+      if (sent) {
+        contactService.updateMessageStatus(myPeerId, remotePeerId, msgId, 'sent');
+        setMessages((prev) =>
+          prev.map((m) => (m.id === msgId ? { ...m, status: 'sent' } : m))
+        );
       }
     }
   };
@@ -535,7 +536,9 @@ export default function ChatScreen({
     return <Check className="w-3 h-3 text-slate-300 shrink-0" title="Sent" />;
   };
 
-  const isPeerOnlineInApp = connectionState === 'connected' && peerPresence === 'active';
+  const isPeerActive = currentPresence === 'active';
+  const isPeerBackground = currentPresence === 'away';
+  const isConnecting = connectionState === 'connecting';
 
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden relative w-full">
@@ -559,22 +562,24 @@ export default function ChatScreen({
               <div className="w-9 h-9 rounded-2xl bg-gradient-to-tr from-cyan-600 to-indigo-600 flex items-center justify-center text-white font-bold text-sm shadow-md">
                 {(contactName || remotePeerId).charAt(0).toUpperCase()}
               </div>
-              {/* Online Green Dot (Only active when in app) */}
+              {/* Online / Background / Offline Dot */}
               <div
-                className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-slate-950 transition-colors ${
-                  isPeerOnlineInApp
-                    ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50'
-                    : connectionState === 'connected'
-                    ? 'bg-amber-500'
-                    : connectionState === 'connecting'
-                    ? 'bg-amber-400 animate-pulse'
+                className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2 border-slate-950 transition-colors ${
+                  isPeerActive
+                    ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50 ring-1 ring-emerald-400'
+                    : isPeerBackground
+                    ? 'bg-amber-400 shadow-sm shadow-amber-400/50 ring-1 ring-amber-300 animate-pulse'
+                    : isConnecting
+                    ? 'bg-amber-500 animate-pulse'
                     : 'bg-slate-600'
                 }`}
                 title={
-                  isPeerOnlineInApp
-                    ? 'Active in app'
-                    : connectionState === 'connected'
-                    ? 'Connected (background)'
+                  isPeerActive
+                    ? 'Online & Active in app'
+                    : isPeerBackground
+                    ? 'Online in background (Data ON)'
+                    : isConnecting
+                    ? 'Connecting to peer...'
                     : 'Offline'
                 }
               />
@@ -587,18 +592,22 @@ export default function ChatScreen({
               <div className="flex items-center gap-1.5 text-[10px]">
                 <span
                   className={`font-medium ${
-                    isPeerOnlineInApp
+                    isPeerActive
                       ? 'text-emerald-400 font-semibold'
-                      : connectionState === 'connected'
+                      : isPeerBackground
+                      ? 'text-amber-300 font-semibold'
+                      : isConnecting
                       ? 'text-amber-400'
                       : 'text-slate-400'
                   }`}
                 >
-                  {isPeerOnlineInApp
+                  {isPeerActive
                     ? 'Active now'
-                    : connectionState === 'connected'
-                    ? 'Online (in background)'
-                    : 'Offline (Queued)'}
+                    : isPeerBackground
+                    ? 'Online in background (Data on)'
+                    : isConnecting
+                    ? 'Connecting...'
+                    : 'Offline'}
                 </span>
                 <span className="text-slate-500">•</span>
                 <span className="font-mono text-slate-400 truncate max-w-[100px] sm:max-w-none">

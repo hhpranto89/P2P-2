@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Radio,
   Settings,
@@ -18,10 +18,12 @@ import {
   Phone,
   Video,
   AlertTriangle,
+  Bell,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { PWAInstallButton } from './PWAInstallButton';
 
-// Generates consistent vivid gradient for contact avatars based on string
 const AVATAR_GRADIENTS = [
   'from-cyan-500 to-blue-600',
   'from-indigo-500 to-purple-600',
@@ -57,24 +59,38 @@ function formatTime(timestamp) {
 
 export default function ContactsScreen({
   myPeerId,
-  contacts,
+  myStatus = 'active', // 'active' | 'away' | 'offline'
+  presenceMap = {},
+  contacts = [],
+  notificationPermission = 'default',
+  onRequestNotifications,
   onSelectContact,
   onAddContact,
   onDeleteContact,
   onOpenSettings,
   activeRemotePeerId,
   connectionState,
+  p2p,
 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
-  const [contactToDelete, setContactToDelete] = useState(null); // Contact currently pending deletion confirmation
+  const [contactToDelete, setContactToDelete] = useState(null);
   const [newPeerId, setNewPeerId] = useState('');
   const [newName, setNewName] = useState('');
   const [copiedMyId, setCopiedMyId] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [inputError, setInputError] = useState('');
 
-  // Filter contacts by search query
+  // Proactively ping saved contacts to refresh their presence (green/yellow/gray dot)
+  useEffect(() => {
+    if (!p2p || contacts.length === 0) return;
+    contacts.slice(0, 8).forEach((c) => {
+      if (c.peerId && c.peerId.toLowerCase() !== myPeerId.toLowerCase()) {
+        p2p.connectToPeer(c.peerId);
+      }
+    });
+  }, [contacts, myPeerId, p2p]);
+
   const filteredContacts = contacts.filter((c) => {
     const q = searchQuery.toLowerCase().trim();
     if (!q) return true;
@@ -140,6 +156,18 @@ export default function ContactsScreen({
     }
   };
 
+  // Helper to determine contact's presence state
+  const getContactPresence = (peerId) => {
+    const cleanId = peerId?.toLowerCase();
+    if (presenceMap && presenceMap[cleanId]) {
+      return presenceMap[cleanId];
+    }
+    if (p2p && typeof p2p.getPeerStatus === 'function') {
+      return p2p.getPeerStatus(cleanId);
+    }
+    return 'offline';
+  };
+
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden relative w-full">
       {/* 1. Top Header */}
@@ -178,17 +206,75 @@ export default function ContactsScreen({
         </div>
       </header>
 
-      {/* 2. My Identity Card (Current user ID & quick invite) */}
-      <div className="px-3 sm:px-4 py-2.5 bg-slate-900/50 border-b border-slate-800/80 shrink-0">
-        <div className="max-w-2xl mx-auto flex items-center justify-between gap-2 bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+      {/* 2. Notification Permission Alert Banner (if not yet granted) */}
+      {notificationPermission !== 'granted' && (
+        <div className="bg-gradient-to-r from-cyan-950/80 via-indigo-950/80 to-slate-900 border-b border-cyan-800/40 px-3 py-2 flex items-center justify-between gap-2 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
-            <div className="w-8 h-8 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400 shrink-0">
-              <User className="w-4 h-4" />
+            <div className="p-1.5 rounded-lg bg-cyan-500/20 text-cyan-300 shrink-0">
+              <Bell className="w-3.5 h-3.5" />
             </div>
+            <p className="text-[11px] text-slate-200 truncate">
+              ব্যাকগ্রাউন্ডে কল ও মেসেজের নোটিফিকেশন পেতে অনুমতি দিন
+            </p>
+          </div>
+          <button
+            onClick={onRequestNotifications}
+            className="px-2.5 py-1 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-[11px] transition shadow-md shadow-cyan-500/20 shrink-0"
+          >
+            অনুমতি দিন
+          </button>
+        </div>
+      )}
+
+      {/* 3. My Identity & Status Card */}
+      <div className="px-3 sm:px-4 py-2 bg-slate-900/50 border-b border-slate-800/80 shrink-0">
+        <div className="max-w-2xl mx-auto flex items-center justify-between gap-2 bg-slate-950 p-2.5 rounded-2xl border border-slate-800 shadow-sm">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="relative shrink-0">
+              <div className="w-9 h-9 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center text-cyan-400">
+                <User className="w-4 h-4" />
+              </div>
+              {/* User's own live status indicator dot */}
+              <div
+                className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2 border-slate-950 ${
+                  myStatus === 'active'
+                    ? 'bg-emerald-500 shadow-emerald-500/50 shadow-sm ring-1 ring-emerald-400'
+                    : myStatus === 'away'
+                    ? 'bg-amber-400 shadow-amber-400/50 shadow-sm animate-pulse ring-1 ring-amber-300'
+                    : 'bg-slate-600'
+                }`}
+                title={
+                  myStatus === 'active'
+                    ? 'Online & Active in app'
+                    : myStatus === 'away'
+                    ? 'Online in background (Data ON)'
+                    : 'Offline'
+                }
+              />
+            </div>
+
             <div className="min-w-0">
-              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                My Peer ID
-              </span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                  My Peer ID
+                </span>
+                {/* Status pill */}
+                {myStatus === 'active' && (
+                  <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-medium">
+                    🟢 Active Online
+                  </span>
+                )}
+                {myStatus === 'away' && (
+                  <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
+                    🟡 Background (Data On)
+                  </span>
+                )}
+                {myStatus === 'offline' && (
+                  <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-400 border border-slate-700 font-medium">
+                    ⚪ Offline
+                  </span>
+                )}
+              </div>
               <p className="text-xs font-mono font-semibold text-cyan-300 truncate">
                 {myPeerId}
               </p>
@@ -217,7 +303,7 @@ export default function ContactsScreen({
         </div>
       </div>
 
-      {/* 3. Search Bar */}
+      {/* 4. Search Bar */}
       <div className="px-3 sm:px-4 pt-3 pb-1 max-w-2xl mx-auto w-full shrink-0">
         <div className="relative">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -239,7 +325,7 @@ export default function ContactsScreen({
         </div>
       </div>
 
-      {/* 4. Contacts List */}
+      {/* 5. Contacts List with Real Presence Dots */}
       <div className="flex-1 overflow-y-auto px-3 sm:px-4 py-2 max-w-2xl mx-auto w-full space-y-1.5 pb-24">
         {filteredContacts.length === 0 ? (
           <div className="flex flex-col items-center justify-center text-center py-16 px-4">
@@ -259,7 +345,7 @@ export default function ContactsScreen({
           filteredContacts.map((contact) => {
             const isCurrentlyActive =
               activeRemotePeerId?.toLowerCase() === contact.peerId.toLowerCase();
-            const isOnline = isCurrentlyActive && connectionState === 'connected';
+            const presence = getContactPresence(contact.peerId);
             const gradient = getAvatarGradient(contact.peerId);
             const initial = (contact.name || contact.peerId).charAt(0).toUpperCase();
 
@@ -274,35 +360,53 @@ export default function ContactsScreen({
                 }`}
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  {/* Avatar */}
+                  {/* Avatar + Live Status Dot */}
                   <div className="relative shrink-0">
                     <div
                       className={`w-11 h-11 rounded-2xl bg-gradient-to-tr ${gradient} flex items-center justify-center text-white font-bold text-base shadow-md`}
                     >
                       {initial}
                     </div>
-                    {/* Status Dot */}
+                    {/* Live Presence Dot:
+                        🟢 Emerald = Active in app
+                        🟡 Amber/Yellow = Online in background (Data on)
+                        ⚪ Slate = Offline
+                    */}
                     <div
                       className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2 border-slate-950 ${
-                        isOnline
-                          ? 'bg-emerald-500'
+                        presence === 'active'
+                          ? 'bg-emerald-500 ring-1 ring-emerald-400'
+                          : presence === 'away'
+                          ? 'bg-amber-400 ring-1 ring-amber-300 animate-pulse'
                           : isCurrentlyActive && connectionState === 'connecting'
                           ? 'bg-amber-500 animate-pulse'
                           : 'bg-slate-600'
                       }`}
-                      title={isOnline ? 'Connected' : 'Saved Peer'}
+                      title={
+                        presence === 'active'
+                          ? 'Online & Active in app'
+                          : presence === 'away'
+                          ? 'Online in background (Data ON)'
+                          : 'Offline'
+                      }
                     />
                   </div>
 
-                  {/* Name and Last Message */}
+                  {/* Name, Presence tag, and Last Message */}
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <h4 className="text-sm font-semibold text-slate-100 truncate group-hover:text-cyan-300 transition">
                         {contact.name || contact.peerId}
                       </h4>
-                      {isCurrentlyActive && (
-                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-mono">
+                      {/* Presence Badge */}
+                      {presence === 'active' && (
+                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
                           Active
+                        </span>
+                      )}
+                      {presence === 'away' && (
+                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 font-medium">
+                          🟡 Background
                         </span>
                       )}
                     </div>
@@ -321,7 +425,6 @@ export default function ContactsScreen({
                     {formatTime(contact.lastMessageTime)}
                   </span>
 
-                  {/* Direct, reliable custom modal trigger for deletion */}
                   <button
                     type="button"
                     onClick={(e) => {
@@ -343,7 +446,7 @@ export default function ContactsScreen({
         )}
       </div>
 
-      {/* 5. Corner '+' Floating Action Button (FAB) */}
+      {/* 6. Corner '+' Floating Action Button (FAB) */}
       <div
         className="fixed bottom-6 right-6 z-30 pointer-events-auto"
         style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
@@ -353,86 +456,35 @@ export default function ContactsScreen({
             setInputError('');
             setIsAddModalOpen(true);
           }}
-          className="h-14 w-14 rounded-2xl bg-gradient-to-tr from-cyan-600 via-cyan-500 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white shadow-xl shadow-cyan-600/40 flex items-center justify-center transition-all duration-200 active:scale-90 hover:scale-105"
+          className="h-14 w-14 rounded-2xl bg-gradient-to-tr from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-white shadow-xl shadow-cyan-500/25 flex items-center justify-center transition-all active:scale-95"
           title="Add New Contact"
-          aria-label="Add New Contact"
         >
-          <Plus className="w-7 h-7 stroke-[2.5]" />
+          <Plus className="w-7 h-7" />
         </button>
       </div>
 
-      {/* 6. In-App Delete Confirmation Modal (100% reliable, never blocked by iframe) */}
-      {contactToDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-150">
-          <div className="w-full max-w-sm rounded-3xl bg-slate-900 border border-slate-800 p-5 shadow-2xl relative">
-            <div className="flex items-center gap-3 pb-3 border-b border-slate-800">
-              <div className="p-2.5 rounded-2xl bg-rose-500/10 text-rose-400 border border-rose-500/20 shrink-0">
-                <Trash2 className="w-5 h-5 text-rose-400" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-sm font-bold text-white">Delete Contact</h3>
-                <p className="text-[11px] text-slate-400 truncate">
-                  {contactToDelete.name || contactToDelete.peerId}
-                </p>
-              </div>
-            </div>
-
-            <p className="text-xs text-slate-300 mt-4 leading-relaxed">
-              Are you sure you want to remove <span className="font-semibold text-white">"{contactToDelete.name || contactToDelete.peerId}"</span>? This contact and its saved chat history will be deleted from your device.
-            </p>
-
-            <div className="mt-5 flex items-center justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => setContactToDelete(null)}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDelete}
-                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold shadow-lg shadow-rose-600/30 active:scale-95 transition"
-              >
-                Delete Contact
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* 7. Add Contact Modal */}
       {isAddModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-          <div className="w-full max-w-sm rounded-3xl bg-slate-900 border border-slate-800 p-5 shadow-2xl relative">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-2">
-                <div className="p-2 rounded-xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-                  <Plus className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">Add New Contact</h3>
-                  <p className="text-[11px] text-slate-400">Save peer ID to your contacts list</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setIsAddModalOpen(false)}
-                className="p-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 w-full max-w-md shadow-2xl relative">
+            <button
+              onClick={() => setIsAddModalOpen(false)}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
 
-            <form onSubmit={handleFormSubmit} className="mt-4 space-y-3.5">
-              {inputError && (
-                <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs">
-                  {inputError}
-                </div>
-              )}
+            <h3 className="text-base font-bold text-slate-100 flex items-center gap-2 mb-1">
+              <Plus className="w-5 h-5 text-cyan-400" />
+              Add New Contact
+            </h3>
+            <p className="text-xs text-slate-400 mb-4">
+              Enter the recipient's Peer ID to connect and chat directly.
+            </p>
 
-              {/* Peer ID Input */}
+            <form onSubmit={handleFormSubmit} className="space-y-3.5">
               <div>
-                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
+                <label className="text-[11px] font-semibold text-slate-300 mb-1 block">
                   Peer ID *
                 </label>
                 <div className="flex gap-1.5">
@@ -440,52 +492,93 @@ export default function ContactsScreen({
                     type="text"
                     required
                     value={newPeerId}
-                    onChange={(e) => setNewPeerId(e.target.value)}
+                    onChange={(e) => {
+                      setNewPeerId(e.target.value);
+                      setInputError('');
+                    }}
                     placeholder="e.g. nexus-abc123"
-                    className="flex-1 bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl px-3 py-2 text-xs font-mono text-cyan-300 outline-none"
-                    autoFocus
+                    className="flex-1 bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl px-3 py-2 text-xs text-slate-100 font-mono outline-none"
                   />
                   <button
                     type="button"
                     onClick={handlePastePeerId}
-                    className="px-2.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition"
-                    title="Paste from clipboard"
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 font-medium"
                   >
                     Paste
                   </button>
                 </div>
               </div>
 
-              {/* Name / Nickname Input */}
               <div>
-                <label className="block text-[11px] font-semibold text-slate-300 mb-1">
-                  Name / Nickname (Optional)
+                <label className="text-[11px] font-semibold text-slate-300 mb-1 block">
+                  Contact Nickname (Optional)
                 </label>
                 <input
                   type="text"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
-                  placeholder="e.g. Alice, Work Laptop, Friend..."
-                  className="w-full bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl px-3 py-2 text-xs text-slate-200 outline-none"
+                  placeholder="e.g. Friend, Colleague"
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl px-3 py-2 text-xs text-slate-100 outline-none"
                 />
               </div>
 
-              <div className="pt-2 flex items-center justify-end gap-2">
+              {inputError && (
+                <div className="text-xs text-rose-400 bg-rose-500/10 border border-rose-500/20 rounded-xl px-3 py-2">
+                  {inputError}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
                 <button
                   type="button"
                   onClick={() => setIsAddModalOpen(false)}
-                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300"
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shadow-lg shadow-cyan-600/30 active:scale-95 transition"
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-xs font-bold text-white shadow-lg shadow-cyan-500/25"
                 >
-                  Save & Message
+                  Save & Chat
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 8. Delete Confirmation Modal */}
+      {contactToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 w-full max-w-sm shadow-2xl">
+            <div className="w-10 h-10 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center text-rose-400 mb-3">
+              <Trash2 className="w-5 h-5" />
+            </div>
+            <h3 className="text-sm font-bold text-slate-100">Delete Contact?</h3>
+            <p className="text-xs text-slate-400 mt-1">
+              Are you sure you want to remove{' '}
+              <span className="font-semibold text-slate-200">
+                {contactToDelete.name || contactToDelete.peerId}
+              </span>{' '}
+              and clear chat history?
+            </p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                type="button"
+                onClick={() => setContactToDelete(null)}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-xs font-bold text-white shadow-md shadow-rose-600/30"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       )}

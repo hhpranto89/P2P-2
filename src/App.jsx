@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Smartphone, X, AlertCircle } from 'lucide-react';
+import { Smartphone, X, AlertCircle, Bell } from 'lucide-react';
 import p2pService from './services/gunSignaling';
 import contactService from './services/contactService';
 import storageService from './services/storageService';
 import audioRinger from './services/audioRinger';
+import notificationService from './services/notificationService';
 import ContactsScreen from './components/ContactsScreen';
 import ChatScreen from './components/ChatScreen';
 import CallScreen from './components/CallScreen';
@@ -18,6 +19,17 @@ export default function App() {
   const [contacts, setContacts] = useState([]);
   const [connectionState, setConnectionState] = useState('new');
   const [iceState, setIceState] = useState('');
+  
+  // Own online/background status: 'active' (green) | 'away' (yellow) | 'offline' (gray)
+  const [myStatus, setMyStatus] = useState(p2pService.getMyStatus());
+  
+  // Contact presence map: peerId -> 'active' | 'away' | 'offline'
+  const [presenceMap, setPresenceMap] = useState({});
+
+  // Notification permission state
+  const [notificationPermission, setNotificationPermission] = useState(
+    notificationService.getPermissionState()
+  );
 
   // Call states
   const [callState, setCallState] = useState('idle'); // 'idle' | 'calling' | 'incoming' | 'connected'
@@ -29,6 +41,12 @@ export default function App() {
   const activeCallInfoRef = useRef(null);
   const isCallOutgoingRef = useRef(false);
   const callConnectedTimeRef = useRef(null);
+
+  // Active chat tracker (for suppressing notifications when actively looking at the conversation)
+  const activeChatPeerRef = useRef(null);
+  useEffect(() => {
+    activeChatPeerRef.current = currentScreen === 'chat' ? remotePeerId?.toLowerCase() : null;
+  }, [currentScreen, remotePeerId]);
 
   // Modals & UI states
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -45,14 +63,40 @@ export default function App() {
   const metrics = useScreenMetrics();
   const { simulationPreset, setSimulationPreset } = metrics;
 
-  // Request system notifications permission once if supported
+  // Refresh and broadcast status whenever network or visibility changes
   useEffect(() => {
-    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-      try {
-        Notification.requestPermission().catch(() => {});
-      } catch (e) {}
-    }
+    const updateStatus = () => {
+      const s = p2pService.getMyStatus();
+      setMyStatus(s);
+    };
+
+    updateStatus();
+    window.addEventListener('online', updateStatus);
+    window.addEventListener('offline', updateStatus);
+    document.addEventListener('visibilitychange', updateStatus);
+    window.addEventListener('focus', updateStatus);
+    window.addEventListener('blur', updateStatus);
+
+    const unsubSignaling = p2pService.on('onSignalingStatus', () => updateStatus());
+
+    return () => {
+      window.removeEventListener('online', updateStatus);
+      window.removeEventListener('offline', updateStatus);
+      document.removeEventListener('visibilitychange', updateStatus);
+      window.removeEventListener('focus', updateStatus);
+      window.removeEventListener('blur', updateStatus);
+      unsubSignaling();
+    };
   }, []);
+
+  // Request system notifications permission helper
+  const handleRequestNotifications = async () => {
+    const granted = await notificationService.requestPermission();
+    setNotificationPermission(notificationService.getPermissionState());
+    if (granted) {
+      showToast('Notifications enabled!');
+    }
+  };
 
   // Load saved contacts for this identity
   const refreshContacts = useCallback(() => {
@@ -84,7 +128,7 @@ export default function App() {
 
       setTimeout(() => {
         handleConnect(cleanTarget);
-      }, 600);
+      }, 500);
     }
   }, [myPeerId, refreshContacts]);
 
@@ -93,6 +137,10 @@ export default function App() {
     audioRinger.stop();
 
     const targetPeer = activeCallInfoRef.current?.peerId || remotePeerId;
+    if (targetPeer) {
+      notificationService.clearCallNotification(targetPeer);
+    }
+
     if (targetPeer && myPeerId) {
       let finalDuration = durationFromScreen;
       let status = 'connected';
@@ -129,61 +177,113 @@ export default function App() {
     setRemoteStream(null);
   }, [localStream, myPeerId, remotePeerId, refreshContacts]);
 
-  // Register P2P Network listeners
+  // Register Centralized P2P Network listeners
   useEffect(() => {
-    p2pService.on('onConnectionStateChange', (state) => {
-      setConnectionState(state);
+    const unsubConn = p2pService.on('onConnectionStateChange', (state, peer) => {
+      if (!peer || peer === remotePeerId) {
+        setConnectionState(state);
+      }
       refreshContacts();
     });
 
-    p2pService.on('onIceStateChange', (state) => {
+    const unsubIce = p2pService.on('onIceStateChange', (state) => {
       setIceState(state);
     });
 
-    p2pService.on('onIncomingCall', (info) => {
+    // Contact Presence updates
+    const unsubPresence = p2pService.on('onPresenceChange', ({ peerId, status }) => {
+      if (peerId) {
+        setPresenceMap((prev) => ({
+          ...prev,
+          [peerId.toLowerCase()]: status,
+        }));
+      }
+    });
+
+    // Incoming Call listener
+    const unsubIncomingCall = p2pService.on('onIncomingCall', (info) => {
       setCallInfo(info);
       activeCallInfoRef.current = { peerId: info.callerId, isVideo: info.isVideo };
       isCallOutgoingRef.current = false;
       callConnectedTimeRef.current = null;
       setCallState('incoming');
 
-      // Native Web Notification if in background
-      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-        try {
-          new Notification('Incoming Nexus Call', {
-            body: `${info.callerName || info.callerId} is calling you (${info.isVideo ? 'Video' : 'Voice'})`,
-            icon: '/icon.svg',
-          });
-        } catch (e) {}
-      }
+      // Start authentic telephone ringtone immediately
+      audioRinger.startIncomingRingtone();
+
+      // Fire system notification for incoming call (service worker background push + web notification)
+      notificationService.showCallNotification(
+        info.callerId,
+        info.callerName || info.callerId,
+        info.isVideo
+      );
     });
 
-    p2pService.on('onCallAccepted', () => {
+    const unsubAccepted = p2pService.on('onCallAccepted', () => {
+      audioRinger.stop();
+      if (activeCallInfoRef.current?.peerId) {
+        notificationService.clearCallNotification(activeCallInfoRef.current.peerId);
+      }
       callConnectedTimeRef.current = Date.now();
       setCallState('connected');
     });
 
-    p2pService.on('onCallRejected', ({ reason }) => {
+    const unsubRejected = p2pService.on('onCallRejected', ({ reason }) => {
       showToast(`Call ${reason === 'busy' ? 'busy' : 'declined by peer'}`);
       handleEndCall();
     });
 
-    p2pService.on('onCallEnded', () => {
+    const unsubEnded = p2pService.on('onCallEnded', () => {
       handleEndCall();
     });
 
-    p2pService.on('onRemoteStream', (stream) => {
+    const unsubRemoteStream = p2pService.on('onRemoteStream', (stream) => {
+      audioRinger.stop();
       setRemoteStream(stream);
       callConnectedTimeRef.current = Date.now();
       setCallState('connected');
     });
 
-    p2pService.on('onMessage', () => {
+    // Central Message Dispatcher:
+    // Handles message persistence, sound, notification, and list refresh regardless of screen
+    const unsubMessage = p2pService.on('onMessage', (msg) => {
       refreshContacts();
+
+      if (msg.type === 'chat') {
+        const sender = (msg.sender || '').toLowerCase();
+        const isCurrentlyViewingThisChat =
+          document.visibilityState === 'visible' &&
+          activeChatPeerRef.current === sender;
+
+        // Play message notification sound
+        audioRinger.playMessageBeep();
+
+        // If app is in background or not currently looking at this active chat, show notification
+        if (!isCurrentlyViewingThisChat) {
+          const contact = contacts.find((c) => c.peerId.toLowerCase() === sender);
+          const senderName = contact?.name || sender;
+
+          notificationService.showMessageNotification(sender, senderName, msg.text);
+
+          if (document.visibilityState === 'visible') {
+            showToast(`💬 ${senderName}: ${msg.text.slice(0, 40)}`);
+          }
+        }
+      }
     });
 
-    return () => {};
-  }, [refreshContacts, showToast, handleEndCall]);
+    return () => {
+      unsubConn();
+      unsubIce();
+      unsubPresence();
+      unsubIncomingCall();
+      unsubAccepted();
+      unsubRejected();
+      unsubEnded();
+      unsubRemoteStream();
+      unsubMessage();
+    };
+  }, [remotePeerId, contacts, refreshContacts, showToast, handleEndCall]);
 
   const handleConnect = (targetPeerId) => {
     const cleanId = (targetPeerId || remotePeerId).trim().toLowerCase();
@@ -197,10 +297,7 @@ export default function App() {
     setActiveContact(contact);
     setRemotePeerId(contact.peerId);
     setCurrentScreen('chat');
-
-    if (connectionState !== 'connected' || remotePeerId !== contact.peerId) {
-      handleConnect(contact.peerId);
-    }
+    handleConnect(contact.peerId);
   };
 
   const handleAddContact = (targetId, nickname) => {
@@ -229,9 +326,12 @@ export default function App() {
 
       setCallInfo({ peerId: remotePeerId, isVideo });
       setCallState('calling');
-      const stream = await p2pService.initiateCall({ isVideo });
+      audioRinger.startOutgoingRingback();
+
+      const stream = await p2pService.initiateCall({ targetPeerId: remotePeerId, isVideo });
       setLocalStream(stream);
     } catch (err) {
+      audioRinger.stop();
       showToast(`Could not access camera/microphone: ${err.message}`);
       setCallState('idle');
       activeCallInfoRef.current = null;
@@ -240,6 +340,10 @@ export default function App() {
 
   const handleAcceptCall = async ({ isVideo }) => {
     try {
+      audioRinger.stop();
+      if (activeCallInfoRef.current?.peerId) {
+        notificationService.clearCallNotification(activeCallInfoRef.current.peerId);
+      }
       const stream = await p2pService.acceptCall({ isVideo });
       setLocalStream(stream);
       callConnectedTimeRef.current = Date.now();
@@ -251,7 +355,12 @@ export default function App() {
   };
 
   const handleRejectCall = () => {
+    audioRinger.stop();
     const targetPeer = activeCallInfoRef.current?.peerId || remotePeerId;
+    if (targetPeer) {
+      notificationService.clearCallNotification(targetPeer);
+    }
+
     if (targetPeer && myPeerId) {
       contactService.saveCallLog(myPeerId, targetPeer, {
         isVideo: activeCallInfoRef.current?.isVideo,
@@ -270,11 +379,9 @@ export default function App() {
 
   const handleRecordingComplete = async (audioBlob, fileName, duration) => {
     try {
-      // Save file locally to device storage
       await storageService.saveToDevice(audioBlob, fileName, 'audio/webm');
       showToast(`Call recording saved (${duration}s)`);
 
-      // Also append as an audio message in the active chat history
       const targetPeer = activeCallInfoRef.current?.peerId || remotePeerId;
       if (myPeerId && targetPeer) {
         const url = URL.createObjectURL(audioBlob);
@@ -320,13 +427,18 @@ export default function App() {
       {currentScreen === 'contacts' ? (
         <ContactsScreen
           myPeerId={myPeerId}
+          myStatus={myStatus}
+          presenceMap={presenceMap}
           contacts={contacts}
+          notificationPermission={notificationPermission}
+          onRequestNotifications={handleRequestNotifications}
           onSelectContact={handleSelectContact}
           onAddContact={handleAddContact}
           onDeleteContact={handleDeleteContact}
           onOpenSettings={() => setIsSettingsOpen(true)}
           activeRemotePeerId={remotePeerId}
           connectionState={connectionState}
+          p2p={p2pService}
         />
       ) : (
         <ChatScreen
@@ -335,6 +447,7 @@ export default function App() {
           remotePeerId={remotePeerId}
           contactName={activeContact?.name || remotePeerId}
           connectionState={connectionState}
+          presenceMap={presenceMap}
           onBack={() => {
             refreshContacts();
             setCurrentScreen('contacts');
